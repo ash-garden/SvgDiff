@@ -65,6 +65,9 @@ class SVGOverlayCompare(QWidget):
 
         self.setLayout(layout)
         self.background_color = QColor(Qt.white)
+
+        self.scale_factor = 1.0
+        self.scroll_area.viewport().installEventFilter(self)
         
     def load_left(self):
         path, _ = QFileDialog.getOpenFileName(self, "左SVGを選択", "", "SVG Files (*.svg)")
@@ -146,9 +149,52 @@ class SVGOverlayCompare(QWidget):
 
         # 表示
         pixmap = QPixmap.fromImage(final_img)
-        self.image_label.setPixmap(pixmap)
-        self.image_label.resize(pixmap.size())
+        # self.image_label.setPixmap(pixmap)
+        # self.image_label.resize(pixmap.size())
+        scaled_pixmap = pixmap.scaled(pixmap.size() * self.scale_factor, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_label.setPixmap(scaled_pixmap)
+        self.image_label.resize(scaled_pixmap.size())
 
+    # def wheelEvent(self, event):
+    #     mods = event.modifiers()
+    #     angle = event.angleDelta().y()
+
+    #     if mods & Qt.ControlModifier:
+    #         # Ctrlが押されていれば拡大/縮小
+    #         factor = 1.25 if angle > 0 else 0.8
+    #         self.scale_factor *= factor
+    #         self.scale_factor = max(0.1, min(10.0, self.scale_factor))
+    #         self.update_display()
+    #         event.accept()
+    #     elif mods & Qt.ShiftModifier:
+    #         # Shiftが押されていれば左右スクロール
+    #         delta = -angle
+    #         h_scrollbar = self.scroll_area.horizontalScrollBar()
+    #         h_scrollbar.setValue(h_scrollbar.value() + delta)
+    #         event.accept()
+    #     else:
+    #         # 通常のスクロール
+    #         super().wheelEvent(event)
+    def eventFilter(self, obj, event):
+        if obj == self.scroll_area.viewport() and event.type() == event.Type.Wheel:
+            mods = event.modifiers()
+            angle = event.angleDelta().y()
+
+            if mods & Qt.ControlModifier:
+                factor = 1.25 if angle > 0 else 0.8
+                self.scale_factor *= factor
+                self.scale_factor = max(0.1, min(10.0, self.scale_factor))
+                self.update_display()
+                return True  # イベントを処理済みにする
+
+            elif mods & Qt.ShiftModifier:
+                delta = -angle
+                h_scrollbar = self.scroll_area.horizontalScrollBar()
+                h_scrollbar.setValue(h_scrollbar.value() + delta)
+                return True  # イベントを処理済みにする
+
+        # それ以外のイベントは親に渡す
+        return super().eventFilter(obj, event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
