@@ -4,9 +4,9 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QSlider, QLabel, QScrollArea
 )
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtGui import QPainter, QPixmap, QImage, QColor
+from PySide6.QtGui import QPainter, QPixmap, QImage, QColor, QBrush
 from PySide6.QtCore import Qt, QSize
-
+from PySide6.QtWidgets import QColorDialog
 
 class SVGOverlayCompare(QWidget):
     def __init__(self):
@@ -32,6 +32,7 @@ class SVGOverlayCompare(QWidget):
 
         load_left_btn = QPushButton("左SVGを読み込む")
         load_right_btn = QPushButton("右SVGを読み込む")
+        bg_color_btn = QPushButton("背景色を変更")  
 
         self.alpha_slider = QSlider(Qt.Horizontal)
         self.alpha_slider.setRange(0, 100)
@@ -45,11 +46,13 @@ class SVGOverlayCompare(QWidget):
 
         load_left_btn.clicked.connect(self.load_left)
         load_right_btn.clicked.connect(self.load_right)
+        bg_color_btn.clicked.connect(self.change_background_color)
 
         layout = QVBoxLayout()
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(load_left_btn)
         btn_layout.addWidget(load_right_btn)
+        btn_layout.addWidget(bg_color_btn)
 
         slider_layout = QHBoxLayout()
         slider_layout.addWidget(self.alpha_label)
@@ -61,7 +64,8 @@ class SVGOverlayCompare(QWidget):
         layout.addWidget(self.scroll_area)
 
         self.setLayout(layout)
-
+        self.background_color = QColor(Qt.white)
+        
     def load_left(self):
         path, _ = QFileDialog.getOpenFileName(self, "左SVGを選択", "", "SVG Files (*.svg)")
         if path:
@@ -85,6 +89,15 @@ class SVGOverlayCompare(QWidget):
         self.diff_enabled = not self.diff_enabled
         self.diff_toggle_btn.setText(f"差分ハイライト {'ON' if self.diff_enabled else 'OFF'}")
         self.update_display()
+    
+    # 背景色変更のメソッド
+    def change_background_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            # self.scene.setBackgroundBrush(QBrush(color))
+            self.background_color = color
+            self.update_display()
+            
 
     def update_display(self):
         if not self.left_renderer or not self.right_renderer:
@@ -110,7 +123,10 @@ class SVGOverlayCompare(QWidget):
 
         # 合成結果を生成
         final_img = QImage(size, QImage.Format_ARGB32)
-        final_img.fill(Qt.white)
+        final_img = QImage(size, QImage.Format_ARGB32)
+        final_img.fill(self.background_color)
+        final_img = QImage(size, QImage.Format_ARGB32)
+        final_img.fill(self.background_color)
         painter = QPainter(final_img)
         painter.drawImage(0, 0, left_img)
         painter.setOpacity(self.alpha)
