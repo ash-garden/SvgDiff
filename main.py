@@ -1,37 +1,71 @@
 import sys
-import numpy as np  # <= 必須
+import numpy as np
+from scipy import ndimage
+
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFileDialog, QSlider, QLabel, QScrollArea, QColorDialog
+    QPushButton, QFileDialog, QSlider, QLabel, QColorDialog,
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem
 )
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtGui import QPainter, QPixmap, QImage, QColor
-from PySide6.QtCore import Qt, QSize, QEvent
-from PySide6.QtGui import QPainter, QPen, QColor
-from scipy import ndimage
+from PySide6.QtGui import QPainter, QPixmap, QImage, QColor, QPen
+from PySide6.QtCore import Qt
+
+
+class GraphicsView(QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.scale_factor = 1.0
+
+    def wheelEvent(self, event):
+        mods = event.modifiers()
+        angle = event.angleDelta().y()
+
+        if mods & Qt.ControlModifier:
+            factor = 1.25 if angle > 0 else 0.8
+            self.scale(factor, factor)
+            self.scale_factor *= factor
+            event.accept()
+        elif mods & Qt.ShiftModifier:
+            delta = -angle
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() + delta
+            )
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
 
 class SVGOverlayCompare(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SVG比較ツール（重ね＋差分＋スクロール）")
-        self.setGeometry(100, 100, 1000, 800)
+        self.setWindowTitle("SVG比較ツール（大画像対応・GPU版）")
+        self.setGeometry(100, 100, 1200, 900)
 
-        # ラベルに画像を表示し、スクロール可能にする
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # Scene & View
+        self.scene = QGraphicsScene(self)
+        self.view = GraphicsView()
+        self.view.setScene(self.scene)
+        self.view.setRenderHint(QPainter.Antialiasing)
+        self.view.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setWidget(self.image_label)
+        # ピクスマップアイテム
+        self.left_pixmap_item = None
+        self.right_pixmap_item = None
 
+        # 差分矩形
+        self.diff_items = []
+
+        # 状態
         self.left_renderer = None
         self.right_renderer = None
+        self.left_img = None
+        self.right_img = None
         self.alpha = 0.5
         self.diff_enabled = False
+        self.background_color = QColor(Qt.white)
 
-        self.left_path = None
-        self.right_path = None
-
+        # UI
         load_left_btn = QPushButton("左SVGを読み込む")
         load_right_btn = QPushButton("右SVGを読み込む")
         bg_color_btn = QPushButton("背景色を変更")
@@ -63,221 +97,125 @@ class SVGOverlayCompare(QWidget):
 
         layout.addLayout(btn_layout)
         layout.addLayout(slider_layout)
-        layout.addWidget(self.scroll_area)
-
+        layout.addWidget(self.view)
         self.setLayout(layout)
-        self.background_color = QColor(Qt.white)
-
-        self.scale_factor = 1.0
-        self.scroll_area.viewport().installEventFilter(self)
 
     def load_left(self):
         path, _ = QFileDialog.getOpenFileName(self, "左SVGを選択", "", "SVG Files (*.svg)")
         if path:
-            self.left_path = path
             self.left_renderer = QSvgRenderer(path)
-            self.update_display()
+            self.left_img = self.svg_to_qimage(self.left_renderer)
+            self.update_scene_pixmaps()
+            self.compute_diff()
 
     def load_right(self):
         path, _ = QFileDialog.getOpenFileName(self, "右SVGを選択", "", "SVG Files (*.svg)")
         if path:
-            self.right_path = path
             self.right_renderer = QSvgRenderer(path)
-            self.update_display()
+            self.right_img = self.svg_to_qimage(self.right_renderer)
+            self.update_scene_pixmaps()
+            self.compute_diff()
 
     def update_alpha(self, value):
         self.alpha = value / 100.0
         self.alpha_label.setText(f"透過度: {value}%")
-        self.update_display()
+        if self.right_pixmap_item:
+            self.right_pixmap_item.setOpacity(self.alpha)
 
     def toggle_diff(self):
         self.diff_enabled = not self.diff_enabled
         self.diff_toggle_btn.setText(f"差分ハイライト {'ON' if self.diff_enabled else 'OFF'}")
-        self.update_display()
+        for item in self.diff_items:
+            item.setVisible(self.diff_enabled)
 
-    # 背景色変更のメソッド
     def change_background_color(self):
         color = QColorDialog.getColor()
         if color.isValid():
             self.background_color = color
-            self.update_display()
+            self.scene.setBackgroundBrush(self.background_color)
 
-    def qimage_to_numpy_uint32(self, img: QImage):
-        """
-        QImage を numpy uint32 配列 (H, W) に変換する。
-        QImage は QImage.Format_ARGB32 を前提。
-        """
-        if img.format() != QImage.Format_ARGB32:
-            img = img.convertToFormat(QImage.Format_ARGB32)
+    def svg_to_qimage(self, renderer):
+        size = renderer.defaultSize()
+        img = QImage(size, QImage.Format_ARGB32)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        renderer.render(p)
+        p.end()
+        return img
 
-        width = img.width()
-        height = img.height()
-        ptr = img.bits()
+    def update_scene_pixmaps(self):
+        if not self.left_img or not self.right_img:
+            return
 
-        # バイト数を height × bytesPerLine で計算
-        byte_count = height * img.bytesPerLine()
+        left_pix = QPixmap.fromImage(self.left_img)
+        right_pix = QPixmap.fromImage(self.right_img)
 
-        # memoryview → numpy
-        arr = np.frombuffer(ptr, dtype=np.uint8, count=byte_count)
+        if not self.left_pixmap_item:
+            self.left_pixmap_item = QGraphicsPixmapItem(left_pix)
+            self.scene.addItem(self.left_pixmap_item)
+        else:
+            self.left_pixmap_item.setPixmap(left_pix)
 
-        row_bytes = img.bytesPerLine()
-        arr = arr.reshape((height, row_bytes))
+        if not self.right_pixmap_item:
+            self.right_pixmap_item = QGraphicsPixmapItem(right_pix)
+            self.right_pixmap_item.setOpacity(self.alpha)
+            self.scene.addItem(self.right_pixmap_item)
+        else:
+            self.right_pixmap_item.setPixmap(right_pix)
+            self.right_pixmap_item.setOpacity(self.alpha)
 
-        # 幅分だけ取り出して 4byte/px → uint32 に再解釈
-        arr = arr[:, :width * 4]
-        arr32 = arr.view(dtype=np.uint32).reshape((height, width))
+        self.view.setSceneRect(0, 0, max(self.left_img.width(), self.right_img.width()),
+                               max(self.left_img.height(), self.right_img.height()))
 
-        return arr32, arr
-    
+    def qimage_to_numpy_tile_safe(self, img: QImage, tile_size=1024):
+        """大画像対応。タイル単位でNumPy配列を生成するジェネレーター"""
+        img = img.convertToFormat(QImage.Format_ARGB32)
+        h, w = img.height(), img.width()
+        for y0 in range(0, h, tile_size):
+            for x0 in range(0, w, tile_size):
+                y1 = min(y0 + tile_size, h)
+                x1 = min(x0 + tile_size, w)
+                tile = img.copy(x0, y0, x1 - x0, y1 - y0)
+                ptr = tile.bits()
+                arr = np.asarray(ptr).reshape((tile.height(), tile.bytesPerLine() // 4, 4))
+                arr = arr[:, :tile.width(), :]
+                yield x0, y0, arr
 
-    # def create_diff_overlay(self, left_img: QImage, right_img: QImage) -> tuple[QImage, int, int]:
-    #     """
-    #     差分領域を赤枠で囲む QImage を返す。
-    #     戻り値: (diff_qimg, offset_x, offset_y)
-    #     """
-    #     w = max(left_img.width(), right_img.width())
-    #     h = max(left_img.height(), right_img.height())
+    def compute_diff(self):
+        if not self.left_img or not self.right_img:
+            return
 
-    #     l = left_img.convertToFormat(QImage.Format_ARGB32)
-    #     r = right_img.convertToFormat(QImage.Format_ARGB32)
+        h, w = self.left_img.height(), self.left_img.width()
+        diff_mask = np.zeros((h, w), dtype=bool)
 
-    #     l32, _ = self.qimage_to_numpy_uint32(l)
-    #     r32, _ = self.qimage_to_numpy_uint32(r)
+        # タイル単位で差分計算
+        for x0, y0, arr_l_tile in self.qimage_to_numpy_tile_safe(self.left_img):
+            tile_r = self.right_img.copy(x0, y0, arr_l_tile.shape[1], arr_l_tile.shape[0])
+            ptr_r = tile_r.bits()
+            arr_r_tile = np.asarray(ptr_r).reshape((tile_r.height(), tile_r.bytesPerLine() // 4, 4))
+            arr_r_tile = arr_r_tile[:, :tile_r.width(), :]
+            diff_tile = np.any(arr_l_tile != arr_r_tile, axis=2)
+            diff_mask[y0:y0+arr_l_tile.shape[0], x0:x0+arr_l_tile.shape[1]] = diff_tile
 
-    #     diff_mask = (l32 != r32)
+        # 差分矩形を更新
+        for item in self.diff_items:
+            self.scene.removeItem(item)
+        self.diff_items.clear()
 
-    #     if not diff_mask.any():
-    #         return None, 0, 0
-
-    #     # 差分矩形を計算
-    #     ys, xs = np.nonzero(diff_mask)
-    #     min_x, max_x = xs.min(), xs.max()
-    #     min_y, max_y = ys.min(), ys.max()
-
-    #     rect_w = max_x - min_x + 1
-    #     rect_h = max_y - min_y + 1
-
-    #     # 差分矩形サイズの QImage を作成
-    #     diff_qimg = QImage(rect_w, rect_h, QImage.Format_ARGB32)
-    #     diff_qimg.fill(Qt.transparent)
-
-    #     # QPainter で赤枠を描画
-    #     painter = QPainter(diff_qimg)
-    #     pen = QPen(QColor(255, 0, 0, 180))  # 半透明赤
-    #     pen.setWidth(3)                     # 枠線の太さ
-    #     painter.setPen(pen)
-    #     painter.drawRect(0, 0, rect_w - 1, rect_h - 1)
-    #     painter.end()
-
-    #     return diff_qimg, min_x, min_y
-    def create_diff_overlay(self, left_img: QImage, right_img: QImage) -> tuple[QImage, int, int]:
-        """
-        差分領域ごとに赤枠を描画する QImage を返す。
-        戻り値: (diff_qimg, offset_x, offset_y)
-        """
-        w = max(left_img.width(), right_img.width())
-        h = max(left_img.height(), right_img.height())
-
-        l = left_img.convertToFormat(QImage.Format_ARGB32)
-        r = right_img.convertToFormat(QImage.Format_ARGB32)
-
-        l32, _ = self.qimage_to_numpy_uint32(l)
-        r32, _ = self.qimage_to_numpy_uint32(r)
-
-        diff_mask = (l32 != r32)
-
-        if not diff_mask.any():
-            return None, 0, 0
-
-        # 連結成分ラベリング（8近傍）
         labeled, num_features = ndimage.label(diff_mask, structure=np.ones((3, 3), dtype=int))
-
-        # 出力画像（全体サイズで透明）
-        diff_qimg = QImage(w, h, QImage.Format_ARGB32)
-        diff_qimg.fill(Qt.transparent)
-
-        painter = QPainter(diff_qimg)
-        pen = QPen(QColor(255, 0, 0, 180))  # 半透明赤
-        pen.setWidth(2)
-        painter.setPen(pen)
-
-        # 各領域ごとに矩形を描画
         for label_id in range(1, num_features + 1):
             ys, xs = np.nonzero(labeled == label_id)
             min_x, max_x = xs.min(), xs.max()
             min_y, max_y = ys.min(), ys.max()
-            rect_w = max_x - min_x + 1
-            rect_h = max_y - min_y + 1
-            painter.drawRect(min_x, min_y, rect_w, rect_h)
+            rect = QGraphicsRectItem(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+            pen = QPen(QColor(255, 0, 0, 200))
+            pen.setWidth(3)
+            rect.setPen(pen)
+            rect.setBrush(Qt.NoBrush)
+            rect.setVisible(self.diff_enabled)
+            self.scene.addItem(rect)
+            self.diff_items.append(rect)
 
-        painter.end()
-
-        return diff_qimg, 0, 0
-    def update_display(self):
-        if not self.left_renderer or not self.right_renderer:
-            return
-
-        # SVGサイズ（大きい方に合わせる）
-        left_size = self.left_renderer.defaultSize()
-        right_size = self.right_renderer.defaultSize()
-        size = left_size.expandedTo(right_size)
-
-        # 左と右の画像を描画（スケーリング考慮せずに原寸描画）
-        left_img = QImage(size, QImage.Format_ARGB32)
-        left_img.fill(Qt.transparent)
-        painter = QPainter(left_img)
-        self.left_renderer.render(painter)
-        painter.end()
-
-        right_img = QImage(size, QImage.Format_ARGB32)
-        right_img.fill(Qt.transparent)
-        painter = QPainter(right_img)
-        self.right_renderer.render(painter)
-        painter.end()
-
-        # 合成結果を生成（背景色で初期化）
-        final_img = QImage(size, QImage.Format_ARGB32)
-        final_img.fill(self.background_color)
-        painter = QPainter(final_img)
-        painter.drawImage(0, 0, left_img)
-        painter.setOpacity(self.alpha)
-        painter.drawImage(0, 0, right_img)
-        painter.setOpacity(1.0)
-
-        # 差分を numpy で作成して一度に描画
-        if self.diff_enabled:
-            diff_overlay, ox, oy = self.create_diff_overlay(left_img, right_img)
-            if diff_overlay is not None:
-                painter.drawImage(ox, oy, diff_overlay)
-
-        painter.end()
-
-        # 表示
-        pixmap = QPixmap.fromImage(final_img)
-        scaled_pixmap = pixmap.scaled(pixmap.size() * self.scale_factor, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.image_label.setPixmap(scaled_pixmap)
-        self.image_label.resize(scaled_pixmap.size())
-
-    def eventFilter(self, obj, event):
-        if obj == self.scroll_area.viewport() and event.type() == QEvent.Wheel:
-            mods = event.modifiers()
-            angle = event.angleDelta().y()
-
-            if mods & Qt.ControlModifier:
-                factor = 1.25 if angle > 0 else 0.8
-                self.scale_factor *= factor
-                self.scale_factor = max(0.1, min(10.0, self.scale_factor))
-                self.update_display()
-                return True  # イベントを処理済みにする
-
-            elif mods & Qt.ShiftModifier:
-                delta = -angle
-                h_scrollbar = self.scroll_area.horizontalScrollBar()
-                h_scrollbar.setValue(h_scrollbar.value() + delta)
-                return True  # イベントを処理済みにする
-
-        # それ以外のイベントは親に渡す
-        return super().eventFilter(obj, event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
