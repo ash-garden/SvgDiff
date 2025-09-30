@@ -1,6 +1,7 @@
 import sys
 import numpy as np
 from scipy import ndimage
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -21,12 +22,12 @@ class GraphicsView(QGraphicsView):
         mods = event.modifiers()
         angle = event.angleDelta().y()
 
-        if mods & Qt.ControlModifier:
+        if mods & Qt.ControlModifier:  # ズーム
             factor = 1.25 if angle > 0 else 0.8
             self.scale(factor, factor)
             self.scale_factor *= factor
             event.accept()
-        elif mods & Qt.ShiftModifier:
+        elif mods & Qt.ShiftModifier:  # 横スクロール
             delta = -angle
             self.horizontalScrollBar().setValue(
                 self.horizontalScrollBar().value() + delta
@@ -39,17 +40,15 @@ class GraphicsView(QGraphicsView):
 class SVGOverlayCompare(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SVG比較ツール（大画像対応・GPU版）")
+        self.setWindowTitle("SVG比較ツール（大画像安定版）")
         self.setGeometry(100, 100, 1200, 900)
 
         # Scene & View
         self.scene = QGraphicsScene(self)
         self.view = GraphicsView()
         self.view.setScene(self.scene)
-        self.view.setRenderHint(QPainter.Antialiasing)
-        self.view.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        # ピクスマップアイテム
+        # ピクスマップ
         self.left_pixmap_item = None
         self.right_pixmap_item = None
 
@@ -61,6 +60,8 @@ class SVGOverlayCompare(QWidget):
         self.right_renderer = None
         self.left_img = None
         self.right_img = None
+        self.left_arr = None
+        self.right_arr = None
         self.alpha = 0.5
         self.diff_enabled = False
         self.background_color = QColor(Qt.white)
@@ -100,11 +101,13 @@ class SVGOverlayCompare(QWidget):
         layout.addWidget(self.view)
         self.setLayout(layout)
 
+    # -------------------- SVG読み込み --------------------
     def load_left(self):
         path, _ = QFileDialog.getOpenFileName(self, "左SVGを選択", "", "SVG Files (*.svg)")
         if path:
             self.left_renderer = QSvgRenderer(path)
             self.left_img = self.svg_to_qimage(self.left_renderer)
+            self.left_arr = self.qimage_to_numpy_safe(self.left_img)
             self.update_scene_pixmaps()
             self.compute_diff()
 
@@ -113,9 +116,11 @@ class SVGOverlayCompare(QWidget):
         if path:
             self.right_renderer = QSvgRenderer(path)
             self.right_img = self.svg_to_qimage(self.right_renderer)
+            self.right_arr = self.qimage_to_numpy_safe(self.right_img)
             self.update_scene_pixmaps()
             self.compute_diff()
 
+    # -------------------- UI更新 --------------------
     def update_alpha(self, value):
         self.alpha = value / 100.0
         self.alpha_label.setText(f"透過度: {value}%")
@@ -134,6 +139,7 @@ class SVGOverlayCompare(QWidget):
             self.background_color = color
             self.scene.setBackgroundBrush(self.background_color)
 
+    # -------------------- SVG → QImage --------------------
     def svg_to_qimage(self, renderer):
         size = renderer.defaultSize()
         img = QImage(size, QImage.Format_ARGB32)
@@ -143,6 +149,16 @@ class SVGOverlayCompare(QWidget):
         p.end()
         return img
 
+    # -------------------- 安全に QImage → NumPy --------------------
+    def qimage_to_numpy_safe(self, img: QImage):
+        img = img.convertToFormat(QImage.Format_ARGB32)
+        # copy() して安全にメモリ確保
+        img_copy = img.copy()
+        ptr = img_copy.bits()
+        arr = np.array(ptr).reshape(img_copy.height(), img_copy.width(), 4)
+        return arr
+
+    # -------------------- Scene 更新 --------------------
     def update_scene_pixmaps(self):
         if not self.left_img or not self.right_img:
             return
@@ -164,51 +180,54 @@ class SVGOverlayCompare(QWidget):
             self.right_pixmap_item.setPixmap(right_pix)
             self.right_pixmap_item.setOpacity(self.alpha)
 
-        self.view.setSceneRect(0, 0, max(self.left_img.width(), self.right_img.width()),
+        self.view.setSceneRect(0, 0,
+                               max(self.left_img.width(), self.right_img.width()),
                                max(self.left_img.height(), self.right_img.height()))
 
-    def qimage_to_numpy_tile_safe(self, img: QImage, tile_size=1024):
-        """大画像対応。タイル単位でNumPy配列を生成するジェネレーター"""
-        img = img.convertToFormat(QImage.Format_ARGB32)
-        h, w = img.height(), img.width()
-        for y0 in range(0, h, tile_size):
-            for x0 in range(0, w, tile_size):
-                y1 = min(y0 + tile_size, h)
-                x1 = min(x0 + tile_size, w)
-                tile = img.copy(x0, y0, x1 - x0, y1 - y0)
-                ptr = tile.bits()
-                arr = np.asarray(ptr).reshape((tile.height(), tile.bytesPerLine() // 4, 4))
-                arr = arr[:, :tile.width(), :]
-                yield x0, y0, arr
+    # -------------------- タイル差分 --------------------
+    def _diff_tile_worker(self, arr_l_tile, arr_r_tile, x0, y0):
+        diff_tile = np.any(arr_l_tile != arr_r_tile, axis=2)
+        return x0, y0, diff_tile
 
     def compute_diff(self):
-        if not self.left_img or not self.right_img:
+        if self.left_arr is None or self.right_arr is None:
             return
 
-        h, w = self.left_img.height(), self.left_img.width()
-        diff_mask = np.zeros((h, w), dtype=bool)
+        h, w, _ = self.left_arr.shape
+        tile_size = 512
 
-        # タイル単位で差分計算
-        for x0, y0, arr_l_tile in self.qimage_to_numpy_tile_safe(self.left_img):
-            tile_r = self.right_img.copy(x0, y0, arr_l_tile.shape[1], arr_l_tile.shape[0])
-            ptr_r = tile_r.bits()
-            arr_r_tile = np.asarray(ptr_r).reshape((tile_r.height(), tile_r.bytesPerLine() // 4, 4))
-            arr_r_tile = arr_r_tile[:, :tile_r.width(), :]
-            diff_tile = np.any(arr_l_tile != arr_r_tile, axis=2)
-            diff_mask[y0:y0+arr_l_tile.shape[0], x0:x0+arr_l_tile.shape[1]] = diff_tile
-
-        # 差分矩形を更新
+        # 差分矩形クリア
         for item in self.diff_items:
             self.scene.removeItem(item)
         self.diff_items.clear()
 
-        labeled, num_features = ndimage.label(diff_mask, structure=np.ones((3, 3), dtype=int))
-        for label_id in range(1, num_features + 1):
+        diff_mask = np.zeros((h, w), dtype=bool)
+
+        # タイル分割
+        tasks = []
+        for y0 in range(0, h, tile_size):
+            for x0 in range(0, w, tile_size):
+                h_tile = min(tile_size, h - y0)
+                w_tile = min(tile_size, w - x0)
+                arr_l_tile = self.left_arr[y0:y0+h_tile, x0:x0+w_tile, :]
+                arr_r_tile = self.right_arr[y0:y0+h_tile, x0:x0+w_tile, :]
+                tasks.append((arr_l_tile, arr_r_tile, x0, y0))
+
+        # ThreadPoolExecutorで差分計算
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(self._diff_tile_worker, *t) for t in tasks]
+            for future in as_completed(futures):
+                x0, y0, diff_tile = future.result()
+                diff_mask[y0:y0+diff_tile.shape[0], x0:x0+diff_tile.shape[1]] = diff_tile
+
+        # ラベリングして矩形作成
+        labeled, num_features = ndimage.label(diff_mask, structure=np.ones((3,3), dtype=int))
+        for label_id in range(1, num_features+1):
             ys, xs = np.nonzero(labeled == label_id)
             min_x, max_x = xs.min(), xs.max()
             min_y, max_y = ys.min(), ys.max()
-            rect = QGraphicsRectItem(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
-            pen = QPen(QColor(255, 0, 0, 200))
+            rect = QGraphicsRectItem(min_x, min_y, max_x-min_x+1, max_y-min_y+1)
+            pen = QPen(QColor(255,0,0,200))
             pen.setWidth(3)
             rect.setPen(pen)
             rect.setBrush(Qt.NoBrush)
