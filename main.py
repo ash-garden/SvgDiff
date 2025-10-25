@@ -1,4 +1,5 @@
 import sys
+import os, json, shutil
 import numpy as np
 from scipy import ndimage
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QSlider, QLabel, QColorDialog,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
-    QProgressDialog, QListWidget, QListWidgetItem, QSplitter,QSizePolicy,
+    QProgressDialog, QListWidget, QListWidgetItem, QSplitter,QSizePolicy,QMessageBox ,
     QDialog,QProgressBar,QDialogButtonBox
 )
 from PySide6.QtSvg import QSvgRenderer
@@ -17,7 +18,9 @@ from scipy.ndimage import label
 import time  
 import cv2
 
-
+class MyExceptionCancel(Exception):
+    def __init__(self, arg=""):
+        self.arg = arg
 
 class GraphicsView(QGraphicsView):
     def __init__(self, parent=None):
@@ -47,7 +50,7 @@ class SVGOverlayCompare(QWidget):
     def __init__(self):        
         super().__init__()
         
-        self.setWindowTitle("SVG比較ツール（進捗キャンセル＋差分リスト対応）")
+        self.setWindowTitle("SVG比較ツール")
         self.setGeometry(100, 100, 1400, 900)
 
         # Scene & View
@@ -55,9 +58,12 @@ class SVGOverlayCompare(QWidget):
         self.view = GraphicsView()
         self.view.setScene(self.scene)
 
+        # 操作性が悪い（レスポンスが悪く使い物にならない）
+        # from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        # self.view.setViewport(QOpenGLWidget())
+
         # 差分リスト
         self.diff_list = QListWidget()
-        # self.diff_list.itemClicked.connect(self.on_diff_item_selected)
         self.diff_list.itemSelectionChanged.connect(self.on_diff_selection_changed)
 
         # レイアウト：左にビュー、右にリスト
@@ -74,7 +80,6 @@ class SVGOverlayCompare(QWidget):
 
         # 差分矩形
         self.diff_items = []
-        self.diff_map = {}  # QListWidgetItem → QGraphicsRectItem
 
         # 状態
         self.left_renderer = None
@@ -111,6 +116,10 @@ class SVGOverlayCompare(QWidget):
         self.lalpha_label = QLabel("透過度:100%")
 
 
+        self.save_result_btn = QPushButton("比較結果を保存")
+        self.load_result_btn = QPushButton("保存結果を読み込み")
+        self.save_result_btn.clicked.connect(self.save_compare_result)
+        self.load_result_btn.clicked.connect(self.load_compare_result)
 
         self.diff_toggle_btn = QPushButton("差分ハイライト ON")
         self.diff_toggle_btn.clicked.connect(self.toggle_diff)
@@ -135,6 +144,8 @@ class SVGOverlayCompare(QWidget):
         layout = QVBoxLayout()
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(bg_color_btn)
+        btn_layout.addWidget(self.save_result_btn)
+        btn_layout.addWidget(self.load_result_btn)
         btn_layout.addWidget(self.diff_toggle_btn)
 
 
@@ -151,121 +162,205 @@ class SVGOverlayCompare(QWidget):
         right_layout.addWidget(self.ralpha_slider)
 
         layout.addLayout(btn_layout)
-        # layout.addLayout(Rslider_layout)
-        # layout.addLayout(path_layout)   # ここをスライダーの下に配置
         layout.addLayout(left_layout)
         layout.addLayout(right_layout)
         layout.addWidget(splitter)
         self.setLayout(layout)
 
+    def log_time(label, t0):
+        print(f"[DEBUG] {label}: {time.time()-t0:.3f} 秒")
+        
     # -------------------- SVG読み込み --------------------
     def load_left(self):
-        path, _ = QFileDialog.getOpenFileName(self, "左SVGを選択", "", "SVG Files (*.svg)")
-        if path:
-            # プログレスダイアログ
-            self.cancel_requested = False
-            progress = QProgressDialog("...", "キャンセル", 0, 100, self)
-            progress.setWindowTitle("進捗")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.canceled.connect(self._on_cancel)
-
-            progress.setLabelText("左パスラベル更新")
-            t0 = time.time()
-            self.left_path_label.setText(f"左画像: {path}")
-            print(f"[DEBUG] 左パスラベル更新: {time.time() - t0:.3f} 秒")
-            progress.setValue(5)
-
-            progress.setLabelText("左ツールチップ更新")
-            t0 = time.time()
-            self.left_path_label.setToolTip(path)
-            print(f"[DEBUG] 左ツールチップ更新: {time.time() - t0:.3f} 秒")
-            progress.setValue(10)
-
-            progress.setLabelText("QSvgRenderer作成")
-            t0 = time.time()
-            self.left_renderer = QSvgRenderer(path)
-            print(f"[DEBUG] QSvgRenderer作成: {time.time() - t0:.3f} 秒")
-            progress.setValue(20)
-
-            progress.setLabelText("svg_to_qimage")
-            t0 = time.time()
-            self.left_img = self.svg_to_qimage(self.left_renderer)
-            print(f"[DEBUG] svg_to_qimage: {time.time() - t0:.3f} 秒")
-            progress.setValue(30)
-
-            progress.setLabelText("qimage_to_numpy_safe")
-            t0 = time.time()
-            self.left_arr = self.qimage_to_numpy_safe(self.left_img)
-            print(f"[DEBUG] qimage_to_numpy_safe: {time.time() - t0:.3f} 秒")
-            progress.setValue(40)
-
-            progress.setLabelText("update_scene_pixmaps")
-            t0 = time.time()
-            self.update_scene_pixmaps()
-            print(f"[DEBUG] update_scene_pixmaps: {time.time() - t0:.3f} 秒")
-            progress.setValue(50)
-
-            progress.setLabelText("compute_diff")
-            t0 = time.time()
-            self.compute_diff()
-            print(f"[DEBUG] compute_diff: {time.time() - t0:.3f} 秒")
-            progress.setValue(100)
-
+        try:
+            self.load_svg("left")
+        except(MyExceptionCancel) as e :
+            QMessageBox.information(self, "情報", "キャンセルしました")
 
     def load_right(self):
-        path, _ = QFileDialog.getOpenFileName(self, "右SVGを選択", "", "SVG Files (*.svg)")
-        if path:
-            # プログレスダイアログ
-            self.cancel_requested = False
-            progress = QProgressDialog("...", "キャンセル", 0, 100, self)
-            self.progress = progress
-            progress.setWindowTitle("進捗")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.canceled.connect(self._on_cancel)
+        try:
+            self.load_svg("right")
+        except(MyExceptionCancel) as e :
+            QMessageBox.information(self, "情報", "キャンセルしました")
 
-            progress.setLabelText("右パスラベル更新")
-            t0 = time.time()
-            self.right_path_label.setText(f"右画像: {path}")
-            print(f"[DEBUG] 右パスラベル更新: {time.time() - t0:.3f} 秒")
-            progress.setValue(5)
+    def load_svg(self, side: str):
+        is_left = (side == "left")
+        title = "左SVGを選択" if is_left else "右SVGを選択"
+        path, _ = QFileDialog.getOpenFileName(self, title, "", "SVG Files (*.svg)")
+        if not path:
+            return
 
-            progress.setLabelText("右ツールチップ更新")
-            t0 = time.time()
-            self.right_path_label.setToolTip(path)
-            print(f"[DEBUG] 右ツールチップ更新: {time.time() - t0:.3f} 秒")
-            progress.setValue(10)
+        progress = QProgressDialog("...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("進捗")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.canceled.connect(self._on_cancel)
 
-            progress.setLabelText("QSvgRenderer作成")
-            t0 = time.time()
-            self.right_renderer = QSvgRenderer(path)
-            print(f"[DEBUG] QSvgRenderer作成: {time.time() - t0:.3f} 秒")
-            progress.setValue(20)
+        # 共通処理
+        progress.setLabelText("ラベル更新")
+        t0 = time.time()
+        label = self.left_path_label if is_left else self.right_path_label
+        label.setText(f"{'左' if is_left else '右'}画像: {path}")
+        label.setToolTip(path)
+        print(f"[DEBUG] ラベル更新: {time.time() - t0:.3f} 秒")
+        progress.setValue(5)
+        if self.cancel_requested: raise MyExceptionCancel("")
+            
 
-            progress.setLabelText("svg_to_qimage")
-            t0 = time.time()
-            self.right_img = self.svg_to_qimage(self.right_renderer)
-            print(f"[DEBUG] svg_to_qimage: {time.time() - t0:.3f} 秒")
-            progress.setValue(30)
+        progress.setLabelText("QSvgRenderer作成")
+        t0 = time.time()
+        renderer = QSvgRenderer(path)
+        print(f"[DEBUG] QSvgRenderer作成: {time.time() - t0:.3f} 秒")
+        progress.setValue(20)
+        if self.cancel_requested: raise MyExceptionCancel("")
 
-            progress.setLabelText("qimage_to_numpy_safe")
-            t0 = time.time()
-            self.right_arr = self.qimage_to_numpy_safe(self.right_img)
-            print(f"[DEBUG] qimage_to_numpy_safe: {time.time() - t0:.3f} 秒")
-            progress.setValue(40)
+        progress.setLabelText("svg_to_qimage")
+        t0 = time.time()
+        img = self.svg_to_qimage(renderer)
+        print(f"[DEBUG] svg_to_qimage: {time.time() - t0:.3f} 秒")
+        progress.setValue(30)
+        if self.cancel_requested: raise MyExceptionCancel("")
 
-            progress.setLabelText("update_scene_pixmaps")
-            t0 = time.time()
-            self.update_scene_pixmaps()
-            print(f"[DEBUG] update_scene_pixmaps: {time.time() - t0:.3f} 秒")
-            progress.setValue(50)
+        progress.setLabelText("qimage_to_numpy_safe")
+        t0 = time.time()
+        arr = self.qimage_to_numpy_safe(img)
+        print(f"[DEBUG] qimage_to_numpy_safe: {time.time() - t0:.3f} 秒")
+        progress.setValue(40)
+        if self.cancel_requested: raise MyExceptionCancel("")
 
-            progress.setLabelText("compute_diff")
-            t0 = time.time()
-            self.compute_diff()
-            print(f"[DEBUG] compute_diff: {time.time() - t0:.3f} 秒")
-            progress.setValue(100)
+        if is_left:
+            self.left_renderer, self.left_img, self.left_arr = renderer, img, arr
+        else:
+            self.right_renderer, self.right_img, self.right_arr = renderer, img, arr
+
+        progress.setLabelText("update_scene_pixmaps")
+        t0 = time.time()
+        self.update_scene_pixmaps()
+        print(f"[DEBUG] update_scene_pixmaps: {time.time() - t0:.3f} 秒")
+        progress.setValue(50)
+        if self.cancel_requested: raise MyExceptionCancel("")
+
+        progress.setLabelText("compute_diff")
+        t0 = time.time()
+        self.compute_diff()
+        print(f"[DEBUG] compute_diff: {time.time() - t0:.3f} 秒")
+        progress.setValue(100)
+        if self.cancel_requested: raise MyExceptionCancel("")
+                    
+    def save_compare_result(self):
+        if self.left_arr is None or self.right_arr is None:
+            return
+
+        folder = QFileDialog.getExistingDirectory(self, "保存先フォルダを選択")
+        if not folder:
+            return
+        self.cancel_requested = False
+        self.progress = QProgressDialog("...", "キャンセル", 0, 100, self)
+        self.progress.setWindowTitle("進捗")
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.setMinimumDuration(0)
+        self.progress.setLabelText("左右SVGコピー開始")
+        self.progress.setValue(0)
+        # 左右SVGコピー
+        left_src = self.left_path_label.text().replace("左画像: ", "")
+        right_src = self.right_path_label.text().replace("右画像: ", "")
+        if os.path.exists(left_src):
+            shutil.copy(left_src, os.path.join(folder, "left.svg"))
+        if os.path.exists(right_src):
+            shutil.copy(right_src, os.path.join(folder, "right.svg"))
+        self.progress.setLabelText("左右SVGコピー完了")
+        self.progress.setValue(10)
+
+        self.progress.setLabelText("差分矩形データJson変換-開始")
+        addVal = 80/len(self.diff_items)
+        # 差分矩形データをJSONに保存
+        rects = []
+        for rect in self.diff_items:
+            self.progress.setValue( self.progress.value() + addVal )
+            r = rect.rect()
+            rects.append({
+                "x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()
+            })
+
+        self.progress.setLabelText("Json保存-開始")
+        self.progress.setValue(90)
+        with open(os.path.join(folder, "diff_rects.json"), "w", encoding="utf-8") as f:
+            json.dump(rects, f, ensure_ascii=False, indent=2)
+        self.progress.setLabelText("Json保存-完了")
+        self.progress.setValue(99)
+
+        print(f"[INFO] 比較結果を保存しました: {folder}")
+        self.progress.setValue(100)
+        QMessageBox.information(self, "情報", "比較結果を保存しました")
+
+    def load_compare_result(self):
+        folder = QFileDialog.getExistingDirectory(self, "保存済み結果フォルダを選択")
+        if not folder:
+            return
+
+        left_svg = os.path.join(folder, "left.svg")
+        self.left_path_label.setText(f"左画像: {left_svg}")
+        right_svg = os.path.join(folder, "right.svg")
+        self.right_path_label.setText(f"右画像: {right_svg}")
+
+        rects_json = os.path.join(folder, "diff_rects.json")
+
+        if not (os.path.exists(left_svg) and os.path.exists(right_svg) and os.path.exists(rects_json)):
+            print("[ERROR] 保存結果が不完全です。")
+            return
+
+        self.cancel_requested = False
+        self.progress = QProgressDialog("...", "キャンセル", 0, 100, self)
+        self.progress.setWindowTitle("進捗")
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.setMinimumDuration(0)
+        self.progress.setLabelText("左右SVG再読み込み開始")
+        self.progress.setValue(10)
+        # 左右再読込
+        self.left_renderer = QSvgRenderer(left_svg)
+        self.right_renderer = QSvgRenderer(right_svg)
+        
+        self.progress.setLabelText("左右SVG再読み込み開始")
+        self.progress.setValue(20)
+        self.left_img = self.svg_to_qimage(self.left_renderer)
+        self.right_img = self.svg_to_qimage(self.right_renderer)
+        self.progress.setLabelText("左右SVG再読み込み完了")
+        self.progress.setValue(50)
+
+        self.progress.setLabelText("update_scene_pixmaps")
+        self.progress.setValue(51)
+        self.update_scene_pixmaps()
+
+        self.progress.setLabelText("差分矩形復元開始")
+        self.progress.setValue(80)
+        for item in self.diff_items:
+            self.scene.removeItem(item)
+        self.diff_items.clear()
+        self.diff_list.clear()
+
+        # 差分矩形復元
+        with open(rects_json, "r", encoding="utf-8") as f:
+            rects = json.load(f)
+
+        for info in rects:
+            rect = QGraphicsRectItem(info["x"], info["y"], info["w"], info["h"])
+            pen = QPen(QColor(255, 0, 0, 200))
+            pen.setWidth(3)
+            rect.setPen(pen)
+            rect.setBrush(Qt.NoBrush)
+            rect.setVisible(self.diff_enabled)
+            self.scene.addItem(rect)
+            self.diff_items.append(rect)
+
+            item = QListWidgetItem(f"差分 ({info['x']}, {info['y']})")
+            item.setData(Qt.UserRole, rect)
+            self.diff_list.addItem(item)
+        self.progress.setLabelText("差分矩形復元完了")
+        self.progress.setValue(99)
+
+        print(f"[INFO] 保存結果を読み込みました: {folder}")    
+        self.progress.setValue(100)
+        QMessageBox.information(self, "情報", "保存結果を読み込みました")
             
     # -------------------- UI更新 --------------------
     def update_Ralpha(self, value):
@@ -276,7 +371,7 @@ class SVGOverlayCompare(QWidget):
 
     def update_Lalpha(self, value):
         self.alpha = value / 100.0
-        self.ralpha_label.setText(f"透過度: {value}%")
+        self.lalpha_label.setText(f"透過度: {value}%")
         if self.left_pixmap_item:
             self.left_pixmap_item.setOpacity(self.alpha)
 
@@ -302,13 +397,8 @@ class SVGOverlayCompare(QWidget):
         p.end()
         return img
 
-    # # -------------------- 安全に QImage → NumPy --------------------
-    # def qimage_to_numpy_safe(self, img: QImage):    #11.6
-    #     img = img.convertToFormat(QImage.Format_ARGB32)
-    #     img_copy = img.copy()
-    #     ptr = img_copy.bits()
-    #     arr = np.array(ptr).reshape(img_copy.height(), img_copy.width(), 4)
-    #     return arr
+    # -------------------- 安全に QImage → NumPy --------------------
+    #13秒
     def qimage_to_numpy_safe(self, img: QImage):    #9.7s
         """
         QImage → NumPy 配列 高速版（ゼロコピー + パディング対応）
@@ -327,27 +417,45 @@ class SVGOverlayCompare(QWidget):
 
         # 不要な列をカット（bytesPerLineで余った分を除去）
         arr = arr[:, :w, :]
-
-        return arr.copy()
+        return np.array(arr)  # copyが必要な場合だけここで
+        # return arr.copy()
         # return arr
+
+    #15秒
+    # def qimage_to_numpy_safe(self, img: QImage):
+    #     """QImage → NumPy配列（安全変換）"""
+    #     if img.format() != QImage.Format_RGBA8888:
+    #         img = img.convertToFormat(QImage.Format_RGBA8888)
+    #     width = img.width()
+    #     height = img.height()
+    #     ptr = img.bits()
+    #     arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4)).copy()
+    #     return arr
+
+
     # -------------------- Scene 更新 --------------------
     def update_scene_pixmaps(self): #10s
         if not self.left_img or not self.right_img:
             return
 
-        # left_pix = QPixmap.fromImage(self.left_img)
-        # right_pix = QPixmap.fromImage(self.right_img)
-        def make_pixmap(img):
-            return QPixmap.fromImage(img)
+        t0 = time.time()
+        # 10.125 秒
+        left_pix = QPixmap.fromImage(self.left_img)
+        right_pix = QPixmap.fromImage(self.right_img)
 
-        
-        # 左右を別スレッドで QPixmap に変換
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_left = executor.submit(make_pixmap, self.left_img)
-            future_right = executor.submit(make_pixmap, self.right_img)
-            left_pix = future_left.result()
-            right_pix = future_right.result()
+        # 10.465 秒
+        # def make_pixmap(img):
+        #     return QPixmap.fromImage(img)
+        # # 左右を別スレッドで QPixmap に変換
+        # with ThreadPoolExecutor(max_workers=2) as executor:
+        #     future_left = executor.submit(make_pixmap, self.left_img)
+        #     future_right = executor.submit(make_pixmap, self.right_img)
+        #     left_pix = future_left.result()
+        #     right_pix = future_right.result()
 
+        print(f"[DEBUG] QPixmapに変換: {time.time() - t0:.3f} 秒")
+
+        t0 = time.time()
         if not self.left_pixmap_item:
             self.left_pixmap_item = QGraphicsPixmapItem(left_pix)
             self.scene.addItem(self.left_pixmap_item)
@@ -361,519 +469,126 @@ class SVGOverlayCompare(QWidget):
         else:
             self.right_pixmap_item.setPixmap(right_pix)
             self.right_pixmap_item.setOpacity(self.alpha)
+        print(f"[DEBUG] QGraphicsPixmapItem: {time.time() - t0:.3f} 秒")
 
+        t0 = time.time()
         self.view.setSceneRect(0, 0,
                                max(self.left_img.width(), self.right_img.width()),
                                max(self.left_img.height(), self.right_img.height()))
-    # def update_scene_pixmaps(self):     #13.9
-    #     if self.left_img is None or self.right_img is None:
-    #         return
+        print(f"[DEBUG] setSceneRect: {time.time() - t0:.3f} 秒")
 
-    #     def make_pixmap(img):
-    #         return QPixmap.fromImage(img)
-
-    #     # 左右を別スレッドで QPixmap に変換
-    #     with ThreadPoolExecutor(max_workers=2) as executor:
-    #         future_left = executor.submit(make_pixmap, self.left_img)
-    #         future_right = executor.submit(make_pixmap, self.right_img)
-    #         left_pix = future_left.result()
-    #         right_pix = future_right.result()
-
-    #     # GUI スレッドで反映
-    #     if self.left_pixmap_item is None:
-    #         self.left_pixmap_item = QGraphicsPixmapItem(left_pix)
-    #         self.scene.addItem(self.left_pixmap_item)
-    #     else:
-    #         self.left_pixmap_item.setPixmap(left_pix)
-
-    #     if self.right_pixmap_item is None:
-    #         self.right_pixmap_item = QGraphicsPixmapItem(right_pix)
-    #         self.right_pixmap_item.setOpacity(self.alpha)
-    #         self.scene.addItem(self.right_pixmap_item)
-    #     else:
-    #         self.right_pixmap_item.setPixmap(right_pix)
-    #         self.right_pixmap_item.setOpacity(self.alpha)
-
-    #     # シーンサイズをフル解像度に設定
-    #     self.view.setSceneRect(0, 0,
-    #                         max(self.left_img.width(), self.right_img.width()),
-    #                         max(self.left_img.height(), self.right_img.height()))
-    # -------------------- タイル差分 --------------------
-    def _diff_tile_worker(self, arr_l_tile, arr_r_tile, x0, y0):
-        diff_tile = np.any(arr_l_tile != arr_r_tile, axis=2)
-        return x0, y0, diff_tile
-
-    # def compute_diff(self):
-    #     if self.left_arr is None or self.right_arr is None:
-    #         return
-
-    #     h, w, _ = self.left_arr.shape
-    #     tile_size = 512
-
-    #     # 差分矩形クリア
-    #     for item in self.diff_items:
-    #         self.scene.removeItem(item)
-    #     self.diff_items.clear()
-    #     self.diff_list.clear()
-    #     self.diff_map.clear()
-
-    #     diff_mask = np.zeros((h, w), dtype=bool)
-
-    #     # タイル分割
-    #     tasks = []
-    #     for y0 in range(0, h, tile_size):
-    #         for x0 in range(0, w, tile_size):
-    #             h_tile = min(tile_size, h - y0)
-    #             w_tile = min(tile_size, w - x0)
-    #             arr_l_tile = self.left_arr[y0:y0+h_tile, x0:x0+w_tile, :]
-    #             arr_r_tile = self.right_arr[y0:y0+h_tile, x0:x0+w_tile, :]
-    #             tasks.append((arr_l_tile, arr_r_tile, x0, y0))
-
-    #     total_tasks = len(tasks)
-
-    #     # プログレスダイアログ
-    #     self.cancel_requested = False
-    #     progress = QProgressDialog("差分を計算中...", "キャンセル", 0, total_tasks, self)
-    #     progress.setWindowTitle("進捗")
-    #     progress.setWindowModality(Qt.WindowModal)
-    #     progress.setMinimumDuration(0)
-    #     progress.canceled.connect(self._on_cancel)
-
-    #     with ThreadPoolExecutor() as executor:
-    #         futures = [executor.submit(self._diff_tile_worker, *t) for t in tasks]
-    #         for i, future in enumerate(as_completed(futures), 1):
-    #             if self.cancel_requested:
-    #                 break
-    #             x0, y0, diff_tile = future.result()
-    #             diff_mask[y0:y0+diff_tile.shape[0], x0:x0+diff_tile.shape[1]] = diff_tile
-    #             progress.setValue(i)
-    #             QApplication.processEvents()
-
-    #     progress.setValue(total_tasks)
-
-    #     if self.cancel_requested:
-    #         return  # キャンセルされた場合は終了
-    # def compute_diff(self):
-    #     if self.left_arr is None or self.right_arr is None:
-    #         return
-
-    #     h, w, _ = self.left_arr.shape
-    #     tile_size = 2048  # CPUなら大きめのタイルでもOK
-
-    #     # 差分矩形クリア
-    #     t0 = time.time()
-    #     for item in self.diff_items:
-    #         self.scene.removeItem(item)
-    #     self.diff_items.clear()
-    #     self.diff_list.clear()
-    #     self.diff_map.clear()
-    #     print(f"[DEBUG] 差分矩形クリア: {time.time() - t0:.3f} 秒")
-    #     t0 = time.time()
-
-    #     # タイルごとのタスク生成
-    #     tasks = []
-    #     for y0 in range(0, h, tile_size):
-    #         for x0 in range(0, w, tile_size):
-    #             h_tile = min(tile_size, h - y0)
-    #             w_tile = min(tile_size, w - x0)
-    #             arr_l_tile = self.left_arr[y0:y0+h_tile, x0:x0+w_tile, :]
-    #             arr_r_tile = self.right_arr[y0:y0+h_tile, x0:x0+w_tile, :]
-    #             tasks.append((arr_l_tile, arr_r_tile, x0, y0))
-    #     print(f"[DEBUG] タイルごとのタスク生成: {time.time() - t0:.3f} 秒")
-    #     t0 = time.time()
-
-    #     total_tasks = len(tasks)
-
-    #     # プログレスダイアログ
-    #     self.cancel_requested = False
-    #     progress = QProgressDialog("差分を計算中...", "キャンセル", 0, total_tasks, self)
-    #     progress.setWindowTitle("進捗")
-    #     progress.setWindowModality(Qt.WindowModal)
-    #     progress.setMinimumDuration(0)
-    #     progress.canceled.connect(self._on_cancel)
-
-    #     diff_mask = np.zeros((h, w), dtype=bool)
-
-    #     # タイルごとの差分計算を並列化
-    #     def diff_tile_worker(arr_l, arr_r, x0, y0):
-    #         diff_tile = np.any(arr_l != arr_r, axis=2)
-    #         return x0, y0, diff_tile
-
-    #     with ThreadPoolExecutor() as executor:
-    #         futures = [executor.submit(diff_tile_worker, *t) for t in tasks]
-    #         for i, future in enumerate(as_completed(futures), 1):
-    #             if self.cancel_requested:
-    #                 break
-    #             x0, y0, diff_tile = future.result()
-    #             diff_mask[y0:y0+diff_tile.shape[0], x0:x0+diff_tile.shape[1]] = diff_tile
-    #             progress.setValue(i)
-    #             QApplication.processEvents()
-    #     print(f"[DEBUG] タイル差分計算完了: {time.time() - t0:.3f} 秒")
-    #     t0 = time.time()
-
-    #     progress.setValue(total_tasks)
-    #     if self.cancel_requested:
-    #         return
-
-    #     # # ■ ラベリング
-    #     # structure = np.ones((3,3), dtype=int)
-    #     # labeled, num_features = ndimage.label(diff_mask, structure=structure)
-    #     # print(f"[DEBUG] ラベリング完了: {time.time() - t0:.3f} 秒, num_features={num_features}")
-    #     # t0 = time.time()
-
-    #     # =============================
-    #     # ■ 並列ラベリング処理
-    #     # =============================
-    #     structure = np.ones((3, 3), dtype=int)
-    #     label_tiles = []
-    #     label_offset = 0
-    #     label_map = np.zeros((h, w), dtype=np.int32)
-
-    #     tasks_label = []
-    #     for y0 in range(0, h, tile_size):
-    #         for x0 in range(0, w, tile_size):
-    #             h_tile = min(tile_size, h - y0)
-    #             w_tile = min(tile_size, w - x0)
-    #             diff_tile = diff_mask[y0:y0+h_tile, x0:x0+w_tile]
-    #             tasks_label.append((diff_tile, x0, y0))
-
-    #     print(f"[DEBUG] ラベリング並列タスク数: {len(tasks_label)}")
-
-    #     def label_worker(diff_tile, x0, y0):
-    #         labeled_tile, num = ndimage.label(diff_tile, structure=structure)
-    #         return x0, y0, labeled_tile, num
-
-    #     total_features = 0
-    #     with ThreadPoolExecutor() as executor:
-    #         futures = [executor.submit(label_worker, *t) for t in tasks_label]
-    #         for future in as_completed(futures):
-    #             x0, y0, labeled_tile, num = future.result()
-    #             if num > 0:
-    #                 # ラベル値をグローバルIDに補正
-    #                 labeled_tile[labeled_tile > 0] += label_offset
-    #                 label_map[y0:y0+labeled_tile.shape[0], x0:x0+labeled_tile.shape[1]] = labeled_tile
-    #                 label_offset += num
-    #                 total_features += num
-
-    #     print(f"[DEBUG] 並列ラベリング完了: {time.time() - t0:.3f} 秒, 総領域数={total_features}")
-    #     t0 = time.time()
-        
-    #     # =============================
-    #     # ■ ベクトル化で外接矩形算出
-    #     # =============================
-    #     ys, xs = np.nonzero(label_map)
-    #     labels = label_map[ys, xs]
-    #     rects = []
-
-    #     # 各ラベルごとにmin/max座標を求める（ベクトル処理）
-    #     if len(labels) > 0:
-    #         unique_labels = np.unique(labels)
-    #         for label_id in unique_labels:
-    #             if label_id == 0:
-    #                 continue
-    #             mask = labels == label_id
-    #             y_coords = ys[mask]
-    #             x_coords = xs[mask]
-    #             x0, x1 = x_coords.min(), x_coords.max()
-    #             y0, y1 = y_coords.min(), y_coords.max()
-    #             rects.append((x0, y0, x1, y1))
-
-    #     print(f"[DEBUG] 外接矩形算出完了: {time.time() - t0:.3f} 秒, 矩形数={len(rects)}")
-    #     t0 = time.time()
-
-    #     # =============================
-    #     # ■ Qt矩形生成
-    #     # =============================
-    #     for x0, y0, x1, y1 in rects:
-    #         rect = QGraphicsRectItem(x0, y0, x1-x0+1, y1-y0+1)
-    #         pen = QPen(QColor(255, 0, 0, 200))
-    #         pen.setWidth(3)
-    #         rect.setPen(pen)
-    #         rect.setBrush(Qt.NoBrush)
-    #         rect.setVisible(self.diff_enabled)
-    #         self.scene.addItem(rect)
-    #         self.diff_items.append(rect)
-
-    #         item = QListWidgetItem(f"差分 ({x0}, {y0})")
-    #         item.setData(Qt.UserRole, rect)
-    #         self.diff_list.addItem(item)
-    #         self.diff_map[(x0, y0)] = rect
-
-    #     print(f"[DEBUG] Qt矩形作成完了: {time.time() - t0:.3f} 秒")
     def compute_diff(self):
+        """左右の画像を比較して差分領域を表示（マスク単位で絞り込み対応版）"""
         if self.left_arr is None or self.right_arr is None:
+            print("左右いずれかの画像が未読み込みのため、比較できません。")
             return
 
-        h, w, _ = self.left_arr.shape
-        tile_size = 2048  # 高解像度比較時のタイルサイズ
-        scale_factor = 0.125  # 低解像度比較時の縮小倍率（1/8）
-
-        # ==========================================================
-        # 差分矩形クリア
-        # ==========================================================
+        # --- 初期化 ---
+        print("差分計算開始")
         t0 = time.time()
         for item in self.diff_items:
             self.scene.removeItem(item)
         self.diff_items.clear()
         self.diff_list.clear()
-        self.diff_map.clear()
         print(f"[DEBUG] 差分矩形クリア: {time.time() - t0:.3f} 秒")
 
+        arr_l = self.left_arr
+        arr_r = self.right_arr
 
-        # ==========================================================
-        # OpenCVで低解像度画像生成
-        # ==========================================================
-        self.progress.setLabelText("低解像度画像生成")
-        self.progress.setValue(51)
-        t0 = time.time()
-        left_low = cv2.resize(self.left_arr, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
-        right_low = cv2.resize(self.right_arr, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
-        outtxt=f"低解像度画像生成完了: {time.time() - t0:.3f} 秒"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(54)
+        if arr_l.shape != arr_r.shape:
+            print("左右の画像サイズが異なります。比較を中止します。")
+            return
 
-        # ==========================================================
-        # 低解像度差分検出
-        # ==========================================================
-        self.progress.setLabelText("低解像度差分マップ作成")
-        self.progress.setValue(55)
-        t0 = time.time()
-        diff_low = np.any(left_low != right_low, axis=2)
-        diff_low = diff_low.astype(np.uint8) * 255
+        h, w, _ = arr_l.shape
 
-        # 小ノイズ除去（モルフォロジー開閉）
-        kernel = np.ones((3,3), np.uint8)
+        # --- ステップ1: 低解像度比較 ---
+        scale = 0.1  # 1/10サイズで比較
+        arr_l_low = cv2.resize(arr_l, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        arr_r_low = cv2.resize(arr_r, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        diff_low = cv2.absdiff(arr_l_low, arr_r_low)
+        diff_low = np.any(diff_low != 0, axis=2).astype(np.uint8) * 255
+
+        # --- ステップ2: ノイズ除去（モルフォロジー） ---
+        kernel = np.ones((3, 3), np.uint8)
         diff_low = cv2.morphologyEx(diff_low, cv2.MORPH_OPEN, kernel)
         diff_low = cv2.morphologyEx(diff_low, cv2.MORPH_CLOSE, kernel)
 
-        # 差分を元のサイズに拡大
-        diff_mask_rough = cv2.resize(diff_low, (w, h), interpolation=cv2.INTER_NEAREST) > 0
-        outtxt=f"低解像度差分マップ作成完了: {time.time() - t0:.3f} 秒"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(59)
+        # --- ステップ3: 差分領域をラベリング ---
+        num_labels, labels_low = cv2.connectedComponents(diff_low)
+        print(f"検出された差分領域数: {num_labels - 1}")
 
-        # ==========================================================
-        # 粗い差分マップから再比較対象領域を抽出
-        # ==========================================================
-        self.progress.setLabelText("高解像度再比較領域作成")
-        self.progress.setValue(60)
-        t0 = time.time()
-        ys, xs = np.nonzero(diff_mask_rough)
-        if len(xs) == 0:
-            print("[DEBUG] 差分なし（低解像度段階）")
-            return
+        # スケール倍率（低解像度 → 高解像度）
+        scale_x = w / diff_low.shape[1]
+        scale_y = h / diff_low.shape[0]
 
-        # 高解像度で再チェックする矩形を生成
-        min_x, max_x = xs.min(), xs.max()
-        min_y, max_y = ys.min(), ys.max()
-        pad = 32  # 周辺を少し広げて再比較
-        min_x = max(0, min_x - pad)
-        min_y = max(0, min_y - pad)
-        max_x = min(w, max_x + pad)
-        max_y = min(h, max_y + pad)
-        outtxt=f"高解像度再比較領域: ({min_x},{min_y}) - ({max_x},{max_y})"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(64)
-
-        # ==========================================================
-        # 高解像度再比較（並列タイル処理）
-        # ==========================================================
-        self.progress.setLabelText("高解像度再比較")
-        self.progress.setValue(65)
-        t0 = time.time()
-        diff_mask = np.zeros((h, w), dtype=bool)
-
-        # 再比較対象領域をタイルに分割
-        tasks = []
-        for y0 in range(min_y, max_y, tile_size):
-            for x0 in range(min_x, max_x, tile_size):
-                h_tile = min(tile_size, max_y - y0)
-                w_tile = min(tile_size, max_x - x0)
-                arr_l_tile = self.left_arr[y0:y0+h_tile, x0:x0+w_tile, :]
-                arr_r_tile = self.right_arr[y0:y0+h_tile, x0:x0+w_tile, :]
-                tasks.append((arr_l_tile, arr_r_tile, x0, y0))
-        print(f"[DEBUG] 高解像度再比較タスク生成: {len(tasks)} 個")
-
-        progress = QProgressDialog("高解像度再比較中...", "キャンセル", 0, len(tasks), self)
-        progress.setWindowTitle("進捗")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.canceled.connect(self._on_cancel)
-
-        def diff_tile_worker(arr_l, arr_r, x0, y0):
-            diff_tile = np.any(arr_l != arr_r, axis=2)
-            return x0, y0, diff_tile
-
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(diff_tile_worker, *t) for t in tasks]
-            for i, future in enumerate(as_completed(futures), 1):
-                if self.cancel_requested:
-                    break
-                x0, y0, diff_tile = future.result()
-                diff_mask[y0:y0+diff_tile.shape[0], x0:x0+diff_tile.shape[1]] = diff_tile
-                progress.setValue(i)
-                QApplication.processEvents()
-
-        progress.setValue(len(tasks))
-        if self.cancel_requested:
-            return
-        outtxt=f"高解像度差分計算完了: {time.time() - t0:.3f} 秒"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(69)
-
-        # # ==========================================================
-        # # ラベリング
-        # # ==========================================================
-        # structure = np.ones((3,3), dtype=int)
-        # labeled, num_features = ndimage.label(diff_mask, structure=structure)
-        # print(f"[DEBUG] ラベリング完了: {time.time() - t0:.3f} 秒, num_features={num_features}")
-        # t0 = time.time()
-        # # =============================
-        # # ■ 並列ラベリング処理
-        # # =============================
-        # structure = np.ones((3, 3), dtype=int)
-        # label_tiles = []
-        # label_offset = 0
-        # label_map = np.zeros((h, w), dtype=np.int32)
-
-        # tasks_label = []
-        # for y0 in range(0, h, tile_size):
-        #     for x0 in range(0, w, tile_size):
-        #         h_tile = min(tile_size, h - y0)
-        #         w_tile = min(tile_size, w - x0)
-        #         diff_tile = diff_mask[y0:y0+h_tile, x0:x0+w_tile]
-        #         tasks_label.append((diff_tile, x0, y0))
-
-        # print(f"[DEBUG] ラベリング並列タスク数: {len(tasks_label)}")
-
-        # def label_worker(diff_tile, x0, y0):
-        #     labeled_tile, num = ndimage.label(diff_tile, structure=structure)
-        #     return x0, y0, labeled_tile, num
-
-        # total_features = 0
-        # with ThreadPoolExecutor() as executor:
-        #     futures = [executor.submit(label_worker, *t) for t in tasks_label]
-        #     for future in as_completed(futures):
-        #         x0, y0, labeled_tile, num = future.result()
-        #         if num > 0:
-        #             # ラベル値をグローバルIDに補正
-        #             labeled_tile[labeled_tile > 0] += label_offset
-        #             label_map[y0:y0+labeled_tile.shape[0], x0:x0+labeled_tile.shape[1]] = labeled_tile
-        #             label_offset += num
-        #             total_features += num
-
-        # print(f"[DEBUG] 並列ラベリング完了: {time.time() - t0:.3f} 秒, 総領域数={total_features}")
-        # t0 = time.time()
-
-        # # ==========================================================
-        # # 外接矩形算出
-        # # ==========================================================
-        # ys, xs = np.nonzero(labeled)
-        # labels = labeled[ys, xs]
-        # rects = []
-        # if len(labels) > 0:
-        #     unique_labels = np.unique(labels)
-        #     for label_id in unique_labels:
-        #         if label_id == 0:
-        #             continue
-        #         mask = labels == label_id
-        #         y_coords = ys[mask]
-        #         x_coords = xs[mask]
-        #         x0, x1 = x_coords.min(), x_coords.max()
-        #         y0, y1 = y_coords.min(), y_coords.max()
-        #         rects.append((x0, y0, x1, y1))
-
-        # print(f"[DEBUG] 外接矩形算出完了: {time.time() - t0:.3f} 秒, 矩形数={len(rects)}")
-        # t0 = time.time()
-
-        # ==========================================================
-        # ■ OpenCVによる高速ラベリング
-        # ==========================================================
-        self.progress.setLabelText("ラベリング")
-        self.progress.setValue(70)
-        t0 = time.time()
-        diff_mask_uint8 = diff_mask.astype(np.uint8)  # OpenCVはuint8を要求
-        num_labels, labeled = cv2.connectedComponents(diff_mask_uint8, connectivity=8)
-        num_features = num_labels - 1  # 背景(0)を除く
-        outtxt = f"ラベリング完了(OpenCV): {time.time() - t0:.3f} 秒, num_features={num_features}"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(79)
-
-        # ==========================================================
-        # 外接矩形算出（並列化版）
-        # ==========================================================
-        self.progress.setLabelText("外接矩形算出")
-        self.progress.setValue(80)
-        t0 = time.time()
-        ys, xs = np.nonzero(labeled)
-        labels = labeled[ys, xs]
-        if len(labels) == 0:
-            print("[DEBUG] 差分なし")
-            return
-
-        unique_labels = np.unique(labels)
+        # --- ステップ4: 各差分領域ごとに高解像度再比較 ---
         rects = []
+        for label_id in range(1, num_labels):  # 0 は背景
+            ys, xs = np.nonzero(labels_low == label_id)
+            if len(xs) == 0 or len(ys) == 0:
+                continue
 
-        # --- 並列処理関数 ---
-        def rect_worker(self,label_ids,length):
-            sub_rects = []
-            for label_id in label_ids:
-                if label_id == 0:
-                    continue
-                mask = labels == label_id
-                y_coords = ys[mask]
-                x_coords = xs[mask]
-                x0, x1 = x_coords.min(), x_coords.max()
-                y0, y1 = y_coords.min(), y_coords.max()
-                sub_rects.append((x0, y0, x1, y1))
-            self.progress.setValue(self.progress.value()+10/length)
-            return sub_rects
+            # ラベル領域（低解像度座標）
+            x1, x2 = xs.min(), xs.max()
+            y1, y2 = ys.min(), ys.max()
 
-        # --- ラベル分割 ---
-        num_threads = min(8, len(unique_labels))  # 例: 最大8スレッド
-        label_chunks = np.array_split(unique_labels, num_threads)
-        
+            # 高解像度座標に変換
+            x1h = int(x1 * scale_x)
+            x2h = int((x2 + 1) * scale_x)
+            y1h = int(y1 * scale_y)
+            y2h = int((y2 + 1) * scale_y)
 
-        # with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(rect_worker, self, chunk,len(label_chunks)) for chunk in label_chunks]
-            for future in as_completed(futures):
-                rects.extend(future.result())
+            # 安全クリップ
+            x1h = max(0, x1h)
+            y1h = max(0, y1h)
+            x2h = min(w, x2h)
+            y2h = min(h, y2h)
 
-        outtxt=f"外接矩形算出完了(並列): {time.time() - t0:.3f} 秒, 矩形数={len(rects)}"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(89)
-        
-        # ==========================================================
-        # Qt矩形生成
-        # ==========================================================
-        self.progress.setLabelText("Qt矩形生成")
-        self.progress.setValue(90)
-        t0 = time.time()
-        for x0, y0, x1, y1 in rects:
-            rect = QGraphicsRectItem(x0, y0, x1-x0+1, y1-y0+1)
-            pen = QPen(QColor(255, 0, 0, 200))
-            pen.setWidth(3)
-            rect.setPen(pen)
-            rect.setBrush(Qt.NoBrush)
-            rect.setVisible(self.diff_enabled)
-            self.scene.addItem(rect)
-            self.diff_items.append(rect)
+            # 領域抽出
+            arr_l_tile = arr_l[y1h:y2h, x1h:x2h]
+            arr_r_tile = arr_r[y1h:y2h, x1h:x2h]
+            if arr_l_tile.size == 0 or arr_r_tile.size == 0:
+                continue
 
-            item = QListWidgetItem(f"差分 ({x0}, {y0})")
+            # 高解像度差分
+            diff_high = cv2.absdiff(arr_l_tile, arr_r_tile)
+            diff_high = np.any(diff_high != 0, axis=2)
+
+            # 差分座標抽出
+            ys_h, xs_h = np.nonzero(diff_high)
+            if len(xs_h) == 0 or len(ys_h) == 0:
+                continue
+
+            # --- 小さいノイズ除去（面積閾値） ---
+            area = (x2h - x1h) * (y2h - y1h)
+            if area < 100:  # 面積閾値
+                continue
+
+            # --- 最終的な矩形領域を算出 ---
+            rect = QRectF(
+                float(x1h + xs_h.min()),
+                float(y1h + ys_h.min()),
+                float(xs_h.max() - xs_h.min()),
+                float(ys_h.max() - ys_h.min())
+            )
+            rects.append(rect)
+
+        # --- ステップ5: 差分矩形を描画 ---
+        pen = QPen(Qt.red)
+        for rect in rects:
+            item = QGraphicsRectItem(rect)
+            item.setPen(pen)
+            self.scene.addItem(item)
+            self.diff_items.append(item)
+
+            item = QListWidgetItem(f"差分 ({rect.x()}, {rect.y()})")
             item.setData(Qt.UserRole, rect)
             self.diff_list.addItem(item)
-            self.diff_map[(x0, y0)] = rect
-        outtxt=f"Qt矩形作成完了: {time.time() - t0:.3f} 秒"
-        print("[DEBUG] "+ outtxt)        
-        self.progress.setLabelText(outtxt)
-        self.progress.setValue(99)
+
+        print(f"描画された差分矩形数: {len(rects)}")
+        print("差分計算完了")
+        QMessageBox.information(self, "情報", "差分表示完了しました")
 
     def _on_cancel(self):
         self.cancel_requested = True
@@ -885,9 +600,12 @@ class SVGOverlayCompare(QWidget):
             return
         item = items[0]  # 複数選択対応ならループする
         data = item.data(Qt.UserRole)
-        if isinstance(data, QGraphicsRectItem):
-            center_point = data.sceneBoundingRect().center()
-            self.view.centerOn(center_point)
+
+        # QGraphicsRectItem の場合
+        if isinstance(data, QRectF):
+            center_point = data.center()
+            self.view.centerOn(center_point)       # 中心に移動
+            self.view.ensureVisible(data, 20, 20)  # 余白20pxで矩形を表示           
 
 
 if __name__ == "__main__":
